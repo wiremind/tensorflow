@@ -179,7 +179,7 @@ elif [[ ${TF_DOCKER_BUILD_TYPE} == "mkl-horovod" ]]; then
     ORIG_DOCKERFILE="${ORIG_DOCKERFILE}.mkl-horovod"
   fi
 elif   [[ ${TF_DOCKER_BUILD_TYPE} == "gpu" ]]; then
-  DOCKER_BINARY="nvidia-docker"
+  DOCKER_BINARY="docker"
 
   FINAL_TAG="${FINAL_TAG}-gpu"
   if [[ ${ORIG_DOCKERFILE} == *"."* ]]; then
@@ -305,7 +305,7 @@ if [[ "${TF_DOCKER_BUILD_IS_DEVEL}" == "no" ]]; then
 "/# --- ~ DO NOT EDIT OR DELETE BETWEEN THE LINES --- #/c"\
 "COPY ${PIP_WHL} /\n"\
 "RUN pip --no-cache-dir install /${PIP_WHL}" "${ORIG_DOCKERFILE}" \
-      > "${DOCKERFILE}"    
+      > "${DOCKERFILE}"
     fi
     echo "Using local pip wheel from: ${TF_DOCKER_BUILD_CENTRAL_PIP}"
     echo
@@ -318,7 +318,7 @@ if [[ "${TF_DOCKER_BUILD_IS_DEVEL}" == "no" ]]; then
       popd
       PIP_WHL_PATH=`find ${TMP_DIR} -name "*.whl"`
       PIP_WHL=$(basename "${PIP_WHL_PATH}")
-      echo "PIP_WHL= ${PIP_WHL}"    
+      echo "PIP_WHL= ${PIP_WHL}"
       echo
       TF_DOCKER_BUILD_ARGS+=("--build-arg TF_WHL_URL=${PIP_WHL}")
       cp "${ORIG_DOCKERFILE}" "${DOCKERFILE}"
@@ -365,7 +365,7 @@ else # TF_DOCKER_BUILD_IS_DEVEL == 'yes'
       TF_BAZEL_BUILD_OPTIONS=("--config=mkl --copt=-mavx --cxxopt=-D_GLIBCXX_USE_CXX11_ABI=0")
     else
       TF_BAZEL_BUILD_OPTIONS="${TF_BAZEL_BUILD_OPTIONS}"
-    fi   
+    fi
     TF_DOCKER_BUILD_ARGS+=("--build-arg TF_BUILD_VERSION=${TF_DOCKER_BUILD_DEVEL_BRANCH}")
     echo "TF_DOCKER_BUILD_ARGS=${TF_DOCKER_BUILD_ARGS[@]}"
 
@@ -419,130 +419,4 @@ if [[ $? == "0" ]]; then
 else
   die "FAIL: ${DOCKER_BINARY} build of ${IMG} with Dockerfile ${DOCKERFILE} "\
 "failed"
-fi
-
-
-# Make sure that there is no other containers of the same image running
-# TODO(cais): Move to an earlier place.
-if "${DOCKER_BINARY}" ps | grep -q "${IMG}"; then
-  die "ERROR: It appears that there are docker containers of the image "\
-"${IMG} running. Please stop them before proceeding"
-fi
-
-# Start a docker container from the newly-built docker image
-DOCKER_RUN_LOG="${TMP_DIR}/docker_run.log"
-echo ""
-echo "Running docker container from image ${IMG}..."
-echo "  Log file is at: ${DOCKER_RUN_LOG}"
-echo ""
-
-if [[ "${TF_DOCKER_BUILD_IS_DEVEL}" == "no" ]]; then
-  "${DOCKER_BINARY}" run --rm -p ${CONTAINER_PORT}:${CONTAINER_PORT} \
-      -v ${TMP_DIR}/notebooks:/root/notebooks "${IMG}" \
-      2>&1 > "${DOCKER_RUN_LOG}" &
-
-  # Get the container ID
-  CONTAINER_ID=""
-  while [[ -z ${CONTAINER_ID} ]]; do
-    sleep 1
-    echo "Polling for container ID..."
-    CONTAINER_ID=$("${DOCKER_BINARY}" ps | grep "${IMG}" | awk '{print $1}')
-  done
-
-  echo "ID of the running docker container: ${CONTAINER_ID}"
-  echo ""
-
-  if [[ ${TF_DOCKER_BUILD_IS_DEVEL} == "no" ]]; then
-    # Non-devel docker build: Do some basic sanity checks on jupyter notebook
-    # on the running docker container
-    echo ""
-    echo "Performing basic sanity checks on the running container..."
-    if wget -qO- "http://127.0.0.1:${CONTAINER_PORT}/tree" &> /dev/null
-    then
-      echo "  PASS: wget tree"
-    else
-      mark_check_failed "  FAIL: wget tree"
-    fi
-
-    for NB in ${TMP_DIR}/notebooks/*.ipynb; do
-      NB_BASENAME=$(basename "${NB}")
-      NB_URL="http://127.0.0.1:${CONTAINER_PORT}/notebooks/${NB_BASENAME}"
-      if wget -qO- "${NB_URL}" -o "${TMP_DIR}/${NB_BASENAME}" &> /dev/null
-      then
-        echo "  PASS: wget ${NB_URL}"
-      else
-        mark_check_failed  "  FAIL: wget ${NB_URL}"
-      fi
-    done
-  fi
-
-  # Stop the running docker container
-  sleep 1
-  "${DOCKER_BINARY}" stop --time=0 ${CONTAINER_ID}
-fi
-
-
-# Clean up
-echo "Cleaning up temporary directory: ${TMP_DIR} ..."
-rm -rf "${TMP_DIR}" || echo "ERROR: Failed to remove directory ${TMP_DIR}"
-
-
-# Summarize result
-echo ""
-if [[ ${CHECK_FAILED} == "0" ]]; then
-  echo "PASS: basic checks on newly-built image \"${IMG}\" succeeded"
-else
-  die "FAIL: basic checks on newly-built image \"${IMG}\" failed"
-fi
-
-
-# Apply the final image name and tag
-FINAL_IMG="${FINAL_IMAGE_NAME}:${FINAL_TAG}"
-
-DOCKER_VER=$("${DOCKER_BINARY}" version | grep Version | head -1 | awk '{print $NF}')
-if [[ -z "${DOCKER_VER}" ]]; then
-  die "ERROR: Failed to determine ${DOCKER_BINARY} version"
-fi
-DOCKER_MAJOR_VER=$(echo "${DOCKER_VER}" | cut -d. -f 1)
-DOCKER_MINOR_VER=$(echo "${DOCKER_VER}" | cut -d. -f 2)
-
-FORCE_TAG=""
-if [[ "${DOCKER_MAJOR_VER}" -le 1 ]] && \
-   [[ "${DOCKER_MINOR_VER}" -le 9 ]]; then
-  FORCE_TAG="--force"
-fi
-
-"${DOCKER_BINARY}" tag ${FORCE_TAG} "${IMG}" "${FINAL_IMG}" || \
-    die "Failed to tag intermediate docker image ${IMG} as ${FINAL_IMG}"
-
-echo ""
-echo "Successfully tagged docker image: ${FINAL_IMG}"
-
-# Optional: call command specified by TF_DOCKER_BUILD_PUSH_CMD to push image
-if [[ ! -z "${TF_DOCKER_BUILD_PUSH_CMD}" ]]; then
-  ${TF_DOCKER_BUILD_PUSH_CMD} ${FINAL_IMG}
-  if [[ $? == "0" ]]; then
-    echo "Successfully pushed Docker image ${FINAL_IMG}"
-  else
-    die "FAIL: Failed to push Docker image ${FINAL_IMG}"
-  fi
-fi
-
-# Optional: set TF_DOCKER_BUILD_PUSH_WITH_CREDENTIALS to push image
-if [[ ! -z "${TF_DOCKER_BUILD_PUSH_WITH_CREDENTIALS}" ]]; then
-
-  docker login -u "${TF_DOCKER_USERNAME}" \
-  -p "${TF_DOCKER_PASSWORD}"
-
-  if [[ $? != "0" ]]; then
-    die "FAIL: Unable to login. Invalid credentials."
-  fi
-  docker push "${FINAL_IMG}"
-  if [[ $? == "0" ]]; then
-    docker logout
-    echo "Successfully pushed Docker image ${FINAL_IMG}"
-  else
-    docker logout
-    die "FAIL: Failed to push Docker image ${FINAL_IMG}"
-  fi
 fi
